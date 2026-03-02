@@ -30,8 +30,8 @@ IPFS_GATEWAY_URL=https://ipfs.io/ipfs/
 ETHEREUM_RPC_URL=https://eth.llamarpc.com
 
 # Server Configuration
-PORT=3001
-VITE_API_URL=http://localhost:3001
+PORT=3012
+VITE_API_URL=http://localhost:3012
 ```
 
 ## Usage
@@ -45,7 +45,7 @@ npm run dev
 ```
 
 This will start:
-- Backend API on http://localhost:3001
+- Backend API on http://localhost:3012
 - Frontend dev server on http://localhost:5173
 
 ### Production Build
@@ -115,7 +115,7 @@ This application is ready for deployment on Coolify:
 3. Configure environment variables:
    - `IPFS_GATEWAY_URL` - IPFS gateway URL (default: https://ipfs.io/ipfs/)
    - `ETHEREUM_RPC_URL` - Ethereum RPC endpoint (default: https://eth.llamarpc.com)
-   - `PORT` - 3000
+   - `PORT` - 3012
 4. Deploy!
 
 ### Method 2: Docker Compose
@@ -123,14 +123,14 @@ This application is ready for deployment on Coolify:
 1. In Coolify, create a new resource and select "Docker Compose"
 2. Upload or link the `docker-compose.yml` file
 3. Configure the same environment variables
-4. The app will be available on port 3000
+4. The app will be available on port 3012
 
 ### Environment Variables for Production
 
 ```env
 IPFS_GATEWAY_URL=https://ipfs.io/ipfs/
 ETHEREUM_RPC_URL=https://eth.llamarpc.com
-PORT=3000
+PORT=3012
 NODE_ENV=production
 ```
 
@@ -138,7 +138,7 @@ NODE_ENV=production
 
 ```bash
 docker build -t ipfs-checker .
-docker run -p 3000:3000 -e PORT=3000 ipfs-checker
+docker run -p 3012:3012 -e PORT=3012 ipfs-checker
 ```
 
 ### Docker Compose Locally

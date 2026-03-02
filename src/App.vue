@@ -9,13 +9,17 @@ const progress = reactive({
   total: 0,
   percentage: 0
 })
+const stats = reactive({
+  found: 0,
+  skipped: 0
+})
+const statusMessage = ref('')
 const results = ref([])
 const contractInfo = ref(null)
 const error = ref(null)
 const eventSource = ref(null)
 
 function extractAddress(input) {
-  // Extract address from URL or direct address
   const addressMatch = input.match(/0x[a-fA-F0-9]{40}/)
   return addressMatch ? addressMatch[0] : input.trim()
 }
@@ -32,54 +36,64 @@ async function startAnalysis() {
   results.value = []
   error.value = null
   isAnalyzing.value = true
+  statusMessage.value = ''
   progress.current = 0
   progress.total = 0
   progress.percentage = 0
+  stats.found = 0
+  stats.skipped = 0
   
-  // Close existing connection
   if (eventSource.value) {
     eventSource.value.close()
   }
   
-  // Create SSE connection - use relative URL for production, env var for dev
   const baseUrl = import.meta.env.VITE_API_URL || ''
-  eventSource.value = new EventSource(`${baseUrl}/api/analyze/${address}?maxTokens=100&delay=50`)
+  eventSource.value = new EventSource(`${baseUrl}/api/analyze/${address}?maxTokens=10000&delay=300`)
   
   eventSource.value.onmessage = (event) => {
     const data = JSON.parse(event.data)
     
     switch (data.type) {
       case 'connected':
-        console.log('Connected to analysis stream')
+        statusMessage.value = 'Connected, starting analysis...'
         break
         
       case 'info':
-        console.log(data.message)
+        statusMessage.value = data.message
         break
         
       case 'start':
         progress.total = data.total
         contractInfo.value = data.contract
+        statusMessage.value = `Scanning ${data.total} token IDs...`
         break
         
-      case 'token':
-        // Add or update token in results
+      case 'token': {
         const existingIndex = results.value.findIndex(r => r.tokenId === data.token.tokenId)
         if (existingIndex >= 0) {
           results.value[existingIndex] = data.token
         } else {
           results.value.push(data.token)
         }
-        
-        // Sort by tokenId
         results.value.sort((a, b) => a.tokenId - b.tokenId)
         
+        stats.found = results.value.length
         progress.current = data.progress.current
         progress.percentage = data.progress.percentage
+        statusMessage.value = `Found ${stats.found} tokens, skipped ${stats.skipped} empty IDs...`
+        break
+      }
+      
+      case 'skip':
+        stats.skipped++
+        progress.current = data.progress.current
+        progress.percentage = data.progress.percentage
+        statusMessage.value = `Found ${stats.found} tokens, skipped ${stats.skipped} empty IDs...`
         break
         
       case 'complete':
         isAnalyzing.value = false
+        statusMessage.value = `Done! ${stats.found} tokens found, ${stats.skipped} empty IDs skipped.`
         eventSource.value.close()
         break
         
@@ -93,7 +107,10 @@ async function startAnalysis() {
   
   eventSource.value.onerror = (err) => {
     console.error('SSE error:', err)
-    error.value = 'Connection error. Please try again.'
+    // Only show error if we haven't received any data yet
+    if (results.value.length === 0 && !contractInfo.value) {
+      error.value = 'Connection error. Is the backend running?'
+    }
     isAnalyzing.value = false
     eventSource.value.close()
   }
@@ -105,16 +122,7 @@ function stopAnalysis() {
     eventSource.value = null
   }
   isAnalyzing.value = false
-}
-
-function getStatusColor(status) {
-  switch (status) {
-    case 'online': return 'bg-green-100 text-green-800'
-    case 'offline': return 'bg-red-100 text-red-800'
-    case 'error': return 'bg-orange-100 text-orange-800'
-    case 'none': return 'bg-gray-100 text-gray-600'
-    default: return 'bg-yellow-100 text-yellow-800'
-  }
+  statusMessage.value = `Stopped. ${stats.found} tokens found so far.`
 }
 </script>
 
@@ -130,9 +138,12 @@ function getStatusColor(status) {
               Analyze Ethereum smart contracts and check IPFS hash availability in real-time
             </p>
           </div>
-          <div class="text-sm text-gray-500">
-            <span class="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-blue-100 text-blue-800">
-              {{ results.length }} tokens
+          <div class="flex gap-2">
+            <span v-if="stats.found > 0" class="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-blue-100 text-blue-800">
+              {{ stats.found }} tokens
+            </span>
+            <span v-if="stats.skipped > 0" class="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-gray-100 text-gray-600">
+              {{ stats.skipped }} skipped
             </span>
           </div>
         </div>
@@ -182,7 +193,7 @@ function getStatusColor(status) {
         <!-- Progress Bar -->
         <div v-if="isAnalyzing && progress.total > 0" class="mt-4">
           <div class="flex justify-between text-sm text-gray-600 mb-1">
-            <span>Progress</span>
+            <span>{{ statusMessage }}</span>
             <span>{{ progress.current }} / {{ progress.total }} ({{ progress.percentage }}%)</span>
           </div>
           <div class="w-full bg-gray-200 rounded-full h-2">
@@ -191,6 +202,11 @@ function getStatusColor(status) {
               :style="{ width: progress.percentage + '%' }"
             ></div>
           </div>
+        </div>
+
+        <!-- Status message when not analyzing -->
+        <div v-else-if="statusMessage" class="mt-4 text-sm text-gray-600">
+          {{ statusMessage }}
         </div>
         
         <!-- Error Message -->
@@ -234,7 +250,7 @@ function getStatusColor(status) {
       />
       
       <!-- Empty State -->
-      <div v-else-if="!isAnalyzing" class="text-center py-12">
+      <div v-else-if="!isAnalyzing && !statusMessage" class="text-center py-12">
         <svg class="mx-auto h-12 w-12 text-gray-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">
           <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"/>
         </svg>
