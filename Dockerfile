@@ -1,7 +1,8 @@
 # Multi-stage build for IPFS NFT Checker
+# Build date: 2026-03-02 (cache buster)
 
 # Stage 1: Build the frontend
-FROM node:20-alpine AS builder
+FROM node:20-slim AS builder
 
 WORKDIR /app
 
@@ -18,12 +19,16 @@ COPY . .
 RUN npm run build
 
 # Stage 2: Production server
-FROM node:20-alpine
+FROM node:20-slim
 
 WORKDIR /app
 
-# Install Python and build tools for native dependencies (better-sqlite3)
-RUN apk add --no-cache python3 make g++
+# Install build tools for native dependencies (better-sqlite3)
+RUN apt-get update && apt-get install -y \
+    python3 \
+    make \
+    g++ \
+    && rm -rf /var/lib/apt/lists/*
 
 # Copy package files
 COPY package*.json ./

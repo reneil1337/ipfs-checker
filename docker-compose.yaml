@@ -5,24 +5,29 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      args:
+        - NODE_ENV=production
     container_name: ipfs-checker
+    restart: unless-stopped
+    
     ports:
-      - "${PORT:-3000}:3000"
+      - "3000:3000"
+    
     environment:
       - NODE_ENV=production
       - PORT=3000
       - IPFS_GATEWAY_URL=${IPFS_GATEWAY_URL:-https://ipfs.io/ipfs/}
       - ETHEREUM_RPC_URL=${ETHEREUM_RPC_URL:-https://eth.llamarpc.com}
-      - VITE_API_URL=${VITE_API_URL:-http://localhost:3000}
+    
     volumes:
       - ipfs-data:/app/data
-    restart: unless-stopped
+    
     healthcheck:
       test: ["CMD", "node", "-e", "require('http').get('http://localhost:3000/api/health', (r) => r.statusCode === 200 ? process.exit(0) : process.exit(1))"]
       interval: 30s
-      timeout: 3s
+      timeout: 10s
       retries: 3
-      start_period: 5s
+      start_period: 60s
 
 volumes:
   ipfs-data:
