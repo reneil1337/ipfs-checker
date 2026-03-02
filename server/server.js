@@ -31,6 +31,8 @@ app.get('/api/analyze/:address', (req, res) => {
   res.setHeader('Cache-Control', 'no-cache');
   res.setHeader('Connection', 'keep-alive');
   res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('X-Accel-Buffering', 'no'); // Disable nginx/proxy buffering
+  res.flushHeaders();
   
   // Send initial connection message
   res.write(`data: ${JSON.stringify({ type: 'connected', address })}\n\n`);
@@ -89,7 +91,11 @@ app.get('/api/config', (req, res) => {
 });
 
 // Serve index.html for all non-API routes (SPA support)
-app.get(/.*/, (req, res) => {
+app.use((req, res, next) => {
+  // Skip API routes
+  if (req.path.startsWith('/api/')) {
+    return next();
+  }
   res.sendFile(path.join(__dirname, '../dist/index.html'));
 });
 
