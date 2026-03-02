@@ -47,9 +47,14 @@ const summary = computed(() => {
     t.imageStatus === 'offline' || 
     t.animationStatus === 'offline'
   ).length
+  const unknown = props.tokens.filter(t =>
+    t.metadataStatus === 'unknown' ||
+    t.imageStatus === 'unknown' ||
+    t.animationStatus === 'unknown'
+  ).length
   const errors = props.tokens.filter(t => t.metadataStatus === 'error').length
   
-  return { total, offline, errors }
+  return { total, offline, unknown, errors }
 })
 
 function getStatusColor(status) {
@@ -86,8 +91,11 @@ function getIpfsUrl(hash) {
 function hasIssues(token) {
   return token.metadataStatus === 'offline' || 
          token.metadataStatus === 'error' ||
+         token.metadataStatus === 'unknown' ||
          token.imageStatus === 'offline' ||
-         token.animationStatus === 'offline'
+         token.imageStatus === 'unknown' ||
+         token.animationStatus === 'offline' ||
+         token.animationStatus === 'unknown'
 }
 </script>
 
@@ -105,6 +113,9 @@ function hasIssues(token) {
           </span>
           <span v-if="summary.offline > 0" class="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-red-100 text-red-800">
             Offline: {{ summary.offline }}
+          </span>
+          <span v-if="summary.unknown > 0" class="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-yellow-100 text-yellow-800">
+            Unknown: {{ summary.unknown }}
           </span>
           <span v-if="summary.errors > 0" class="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-orange-100 text-orange-800">
             Errors: {{ summary.errors }}

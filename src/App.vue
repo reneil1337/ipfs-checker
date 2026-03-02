@@ -1,13 +1,20 @@
 <script setup>
-import { ref, reactive } from 'vue'
+import { ref, reactive, computed, onMounted } from 'vue'
 import TokenTable from './components/TokenTable.vue'
 
 const contractAddress = ref('')
 const isAnalyzing = ref(false)
+const isRechecking = ref(false)
 const progress = reactive({
   current: 0,
   total: 0,
   percentage: 0
+})
+const recheckProgress = reactive({
+  current: 0,
+  total: 0,
+  percentage: 0,
+  updated: 0
 })
 const stats = reactive({
   found: 0,
@@ -16,14 +23,64 @@ const stats = reactive({
 const statusMessage = ref('')
 const results = ref([])
 const contractInfo = ref(null)
+const analysisStatus = ref(null) // 'complete', 'paused', 'in_progress', null
 const error = ref(null)
 const eventSource = ref(null)
+const previousContracts = ref([])
+
+const baseUrl = import.meta.env.VITE_API_URL || ''
 
 function extractAddress(input) {
   const addressMatch = input.match(/0x[a-fA-F0-9]{40}/)
   return addressMatch ? addressMatch[0] : input.trim()
 }
 
+// Load list of previously analyzed contracts
+async function loadPreviousContracts() {
+  try {
+    const resp = await fetch(`${baseUrl}/api/contracts`)
+    if (resp.ok) {
+      previousContracts.value = await resp.json()
+    }
+  } catch { /* ignore */ }
+}
+
+// Load cached results for a contract without starting analysis
+async function loadCachedResults(address) {
+  const normalized = address.toLowerCase()
+  try {
+    const resp = await fetch(`${baseUrl}/api/results/${normalized}`)
+    if (resp.ok) {
+      const data = await resp.json()
+      if (data.analysis) {
+        contractInfo.value = {
+          address: normalized,
+          name: data.analysis.name,
+          symbol: data.analysis.symbol
+        }
+        analysisStatus.value = data.analysis.status
+        stats.found = data.analysis.tokens_found
+        stats.skipped = data.analysis.tokens_skipped
+        progress.total = data.analysis.end_id - data.analysis.start_id + 1
+        progress.current = data.analysis.last_scanned_id - data.analysis.start_id + 1
+        progress.percentage = progress.total > 0 ? Math.round((progress.current / progress.total) * 100) : 0
+
+        if (data.analysis.status === 'complete') {
+          statusMessage.value = `Analysis complete. ${stats.found} tokens found, ${stats.skipped} empty IDs skipped.`
+        } else if (data.analysis.status === 'paused') {
+          statusMessage.value = `Analysis paused at #${data.analysis.last_scanned_id}. ${stats.found} tokens found. Hit Continue to resume.`
+        }
+      }
+      if (data.tokens && data.tokens.length > 0) {
+        results.value = data.tokens
+      }
+      return true
+    }
+  } catch { /* ignore */ }
+  return false
+}
+
+// Start or continue analysis via SSE
 async function startAnalysis() {
   const address = extractAddress(contractAddress.value)
   
@@ -32,22 +89,27 @@ async function startAnalysis() {
     return
   }
   
-  // Reset state
-  results.value = []
   error.value = null
   isAnalyzing.value = true
-  statusMessage.value = ''
-  progress.current = 0
-  progress.total = 0
-  progress.percentage = 0
-  stats.found = 0
-  stats.skipped = 0
+  
+  // Don't reset results -- the backend sends cached tokens first when resuming
+  if (analysisStatus.value !== 'paused' && analysisStatus.value !== 'in_progress') {
+    results.value = []
+    stats.found = 0
+    stats.skipped = 0
+    progress.current = 0
+    progress.total = 0
+    progress.percentage = 0
+    contractInfo.value = null
+    analysisStatus.value = null
+  }
+
+  statusMessage.value = 'Connecting...'
   
   if (eventSource.value) {
     eventSource.value.close()
   }
   
-  const baseUrl = import.meta.env.VITE_API_URL || ''
   eventSource.value = new EventSource(`${baseUrl}/api/analyze/${address}?maxTokens=10000&delay=300`)
   
   eventSource.value.onmessage = (event) => {
@@ -65,6 +127,7 @@ async function startAnalysis() {
       case 'start':
         progress.total = data.total
         contractInfo.value = data.contract
+        analysisStatus.value = 'in_progress'
         statusMessage.value = `Scanning ${data.total} token IDs...`
         break
         
@@ -93,8 +156,10 @@ async function startAnalysis() {
         
       case 'complete':
         isAnalyzing.value = false
+        analysisStatus.value = 'complete'
         statusMessage.value = `Done! ${stats.found} tokens found, ${stats.skipped} empty IDs skipped.`
         eventSource.value.close()
+        loadPreviousContracts()
         break
         
       case 'error':
@@ -107,9 +172,11 @@ async function startAnalysis() {
   
   eventSource.value.onerror = (err) => {
     console.error('SSE error:', err)
-    // Only show error if we haven't received any data yet
     if (results.value.length === 0 && !contractInfo.value) {
       error.value = 'Connection error. Is the backend running?'
+    } else {
+      analysisStatus.value = 'paused'
+      statusMessage.value = `Connection lost. ${stats.found} tokens saved. Hit Continue to resume.`
     }
     isAnalyzing.value = false
     eventSource.value.close()
@@ -122,8 +189,108 @@ function stopAnalysis() {
     eventSource.value = null
   }
   isAnalyzing.value = false
-  statusMessage.value = `Stopped. ${stats.found} tokens found so far.`
+  analysisStatus.value = 'paused'
+  statusMessage.value = `Paused. ${stats.found} tokens saved. Hit Continue to resume.`
 }
+
+function selectContract(address) {
+  contractAddress.value = address
+  loadCachedResults(address)
+}
+
+// Determine button label
+function getButtonLabel() {
+  if (isAnalyzing.value) return null // spinner shown instead
+  if (analysisStatus.value === 'paused' || analysisStatus.value === 'in_progress') return 'Continue Analysis'
+  if (analysisStatus.value === 'complete') return 'Re-analyze'
+  return 'Analyze Contract'
+}
+
+// Count tokens that have offline or unknown statuses (candidates for recheck)
+const recheckCount = computed(() => {
+  return results.value.filter(t =>
+    t.metadataStatus === 'offline' || t.metadataStatus === 'unknown' ||
+    t.imageStatus === 'offline' || t.imageStatus === 'unknown' ||
+    t.animationStatus === 'offline' || t.animationStatus === 'unknown'
+  ).length
+})
+
+// Recheck offline/unknown hashes via SSE
+function startRecheck() {
+  const address = extractAddress(contractAddress.value)
+  if (!address) return
+
+  error.value = null
+  isRechecking.value = true
+  recheckProgress.current = 0
+  recheckProgress.total = 0
+  recheckProgress.percentage = 0
+  recheckProgress.updated = 0
+  statusMessage.value = 'Starting recheck of offline/unknown hashes...'
+
+  if (eventSource.value) {
+    eventSource.value.close()
+  }
+
+  eventSource.value = new EventSource(`${baseUrl}/api/recheck/${address}`)
+
+  eventSource.value.onmessage = (event) => {
+    const data = JSON.parse(event.data)
+
+    switch (data.type) {
+      case 'info':
+        statusMessage.value = data.message
+        break
+
+      case 'recheck': {
+        // Update the token in results with new statuses
+        const idx = results.value.findIndex(r => r.tokenId === data.token.tokenId)
+        if (idx >= 0) {
+          results.value[idx] = { ...results.value[idx], ...data.token }
+        }
+        recheckProgress.current = data.progress.current
+        recheckProgress.total = data.progress.total
+        recheckProgress.percentage = data.progress.percentage
+        if (data.changed) recheckProgress.updated++
+        statusMessage.value = `Rechecking: ${data.progress.current}/${data.progress.total} — ${recheckProgress.updated} updated`
+        break
+      }
+
+      case 'complete':
+        isRechecking.value = false
+        statusMessage.value = `Recheck complete. ${data.updated} token(s) updated.`
+        eventSource.value.close()
+        break
+
+      case 'error':
+        error.value = data.error
+        isRechecking.value = false
+        eventSource.value.close()
+        break
+    }
+  }
+
+  eventSource.value.onerror = () => {
+    // Ignore if we already finished (complete event already processed)
+    if (!isRechecking.value) return
+    isRechecking.value = false
+    statusMessage.value = 'Recheck connection lost.'
+    eventSource.value.close()
+  }
+}
+
+function stopRecheck() {
+  if (eventSource.value) {
+    eventSource.value.close()
+    eventSource.value = null
+  }
+  isRechecking.value = false
+  statusMessage.value = `Recheck stopped. ${recheckProgress.updated} token(s) updated so far.`
+}
+
+onMounted(() => {
+  loadPreviousContracts()
+})
 </script>
 
 <template>
@@ -144,6 +311,12 @@ function stopAnalysis() {
             </span>
             <span v-if="stats.skipped > 0" class="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-gray-100 text-gray-600">
               {{ stats.skipped }} skipped
+            </span>
+            <span v-if="analysisStatus === 'paused'" class="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-yellow-100 text-yellow-800">
+              Paused
+            </span>
+            <span v-else-if="analysisStatus === 'complete'" class="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-green-100 text-green-800">
+              Complete
             </span>
           </div>
         </div>
@@ -169,7 +342,7 @@ function stopAnalysis() {
           />
           <button
             @click="startAnalysis"
-            :disabled="isAnalyzing || !contractAddress"
+            :disabled="isAnalyzing || isRechecking || !contractAddress"
             class="inline-flex items-center px-4 py-2 border border-transparent text-sm font-medium rounded-md shadow-sm text-white bg-indigo-600 hover:bg-indigo-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-indigo-500 disabled:opacity-50 disabled:cursor-not-allowed"
           >
             <span v-if="isAnalyzing">
@@ -179,7 +352,7 @@ function stopAnalysis() {
               </svg>
               Analyzing...
             </span>
-            <span v-else>Analyze Contract</span>
+            <span v-else>{{ getButtonLabel() }}</span>
           </button>
           <button
             v-if="isAnalyzing"
@@ -191,20 +364,21 @@ function stopAnalysis() {
         </div>
         
         <!-- Progress Bar -->
-        <div v-if="isAnalyzing && progress.total > 0" class="mt-4">
+        <div v-if="progress.total > 0" class="mt-4">
           <div class="flex justify-between text-sm text-gray-600 mb-1">
             <span>{{ statusMessage }}</span>
             <span>{{ progress.current }} / {{ progress.total }} ({{ progress.percentage }}%)</span>
           </div>
           <div class="w-full bg-gray-200 rounded-full h-2">
             <div
-              class="bg-indigo-600 h-2 rounded-full transition-all duration-300"
+              class="h-2 rounded-full transition-all duration-300"
+              :class="analysisStatus === 'complete' ? 'bg-green-500' : analysisStatus === 'paused' ? 'bg-yellow-500' : 'bg-indigo-600'"
               :style="{ width: progress.percentage + '%' }"
             ></div>
           </div>
         </div>
 
-        <!-- Status message when not analyzing -->
+        <!-- Status message when no progress bar -->
         <div v-else-if="statusMessage" class="mt-4 text-sm text-gray-600">
           {{ statusMessage }}
         </div>
@@ -224,6 +398,36 @@ function stopAnalysis() {
         </div>
       </div>
 
+      <!-- Previous Contracts -->
+      <div v-if="previousContracts.length > 0 && !contractInfo" class="bg-white rounded-lg shadow mb-8 overflow-hidden">
+        <div class="px-6 py-4 border-b border-gray-200 bg-gray-50">
+          <h3 class="text-sm font-medium text-gray-700">Previous Analyses</h3>
+        </div>
+        <div class="divide-y divide-gray-200">
+          <button
+            v-for="c in previousContracts"
+            :key="c.contract_address"
+            @click="selectContract(c.contract_address)"
+            class="w-full px-6 py-3 flex items-center justify-between hover:bg-gray-50 transition-colors text-left"
+          >
+            <div>
+              <span class="text-sm font-medium text-gray-900">{{ c.name || 'Unknown' }}</span>
+              <span class="text-xs text-gray-500 ml-2">{{ c.symbol || '' }}</span>
+              <p class="text-xs text-gray-400 font-mono">{{ c.contract_address }}</p>
+            </div>
+            <div class="flex gap-2 items-center">
+              <span class="text-xs text-gray-500">{{ c.tokens_found }} tokens</span>
+              <span
+                class="inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium"
+                :class="c.status === 'complete' ? 'bg-green-100 text-green-800' : 'bg-yellow-100 text-yellow-800'"
+              >
+                {{ c.status }}
+              </span>
+            </div>
+          </button>
+        </div>
+      </div>
+
       <!-- Contract Info -->
       <div v-if="contractInfo" class="bg-white rounded-lg shadow p-4 mb-6">
         <div class="flex items-center gap-4">
@@ -232,6 +436,20 @@ function stopAnalysis() {
             <p class="text-sm text-gray-500">{{ contractInfo.symbol || 'Unknown' }}</p>
           </div>
           <div class="flex-1"></div>
+          <button
+            v-if="recheckCount > 0 && !isAnalyzing && !isRechecking"
+            @click="startRecheck"
+            class="inline-flex items-center px-3 py-1.5 border border-orange-300 text-sm font-medium rounded-md text-orange-700 bg-orange-50 hover:bg-orange-100 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-orange-500 transition-colors"
+          >
+            Recheck {{ recheckCount }} offline/unknown
+          </button>
+          <button
+            v-if="isRechecking"
+            @click="stopRecheck"
+            class="inline-flex items-center px-3 py-1.5 border border-gray-300 text-sm font-medium rounded-md text-gray-700 bg-white hover:bg-gray-50 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-orange-500"
+          >
+            Stop recheck
+          </button>
           <a
             :href="`https://etherscan.io/address/${contractInfo.address}`"
             target="_blank"
@@ -240,6 +458,20 @@ function stopAnalysis() {
           >
             View on Etherscan &rarr;
           </a>
+        </div>
+
+        <!-- Recheck Progress Bar -->
+        <div v-if="isRechecking && recheckProgress.total > 0" class="mt-3">
+          <div class="flex justify-between text-sm text-gray-600 mb-1">
+            <span>{{ statusMessage }}</span>
+            <span>{{ recheckProgress.current }} / {{ recheckProgress.total }} ({{ recheckProgress.percentage }}%)</span>
+          </div>
+          <div class="w-full bg-gray-200 rounded-full h-2">
+            <div
+              class="bg-orange-500 h-2 rounded-full transition-all duration-300"
+              :style="{ width: recheckProgress.percentage + '%' }"
+            ></div>
+          </div>
         </div>
       </div>
 
@@ -250,7 +482,7 @@ function stopAnalysis() {
       />
       
       <!-- Empty State -->
-      <div v-else-if="!isAnalyzing && !statusMessage" class="text-center py-12">
+      <div v-else-if="!isAnalyzing && !statusMessage && previousContracts.length === 0" class="text-center py-12">
         <svg class="mx-auto h-12 w-12 text-gray-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">
           <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"/>
         </svg>

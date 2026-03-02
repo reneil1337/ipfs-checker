@@ -1,6 +1,9 @@
 import { ethers } from 'ethers';
 import { fetchMetadata, extractHashesFromMetadata, checkIpfsHash, extractHashFromUri } from './ipfs.js';
-import { saveTokenAnalysis } from './db.js';
+import {
+  saveTokenAnalysis, saveContractAnalysis, updateContractProgress,
+  getContractAnalysis, getContractTokens, saveSkippedToken, isTokenSkipped
+} from './db.js';
 
 // Primary RPC from env, with fallback list
 const PRIMARY_RPC = process.env.ETHEREUM_RPC_URL;
@@ -25,7 +28,6 @@ const ERC721_ABI = [
   'function name() view returns (string)'
 ];
 
-// Build the RPC list: primary first (if set), then fallbacks
 function getRpcList() {
   if (PRIMARY_RPC) {
     return [PRIMARY_RPC, ...FALLBACK_RPCS.filter(r => r !== PRIMARY_RPC)];
@@ -33,12 +35,10 @@ function getRpcList() {
   return FALLBACK_RPCS;
 }
 
-// Create a provider with explicit chainId to avoid network detection delays
 function createProvider(rpcUrl) {
   return new ethers.JsonRpcProvider(rpcUrl, 1, { staticNetwork: true });
 }
 
-// RPC Manager: cycles through RPCs on failure
 class RpcManager {
   constructor() {
     this.rpcs = getRpcList();
@@ -72,7 +72,6 @@ class RpcManager {
   }
 }
 
-// Check if an error is a contract revert (token doesn't exist) vs an RPC issue
 function isTokenNotFound(error) {
   const msg = error.message || '';
   return msg.includes('invalid token ID') ||
@@ -82,7 +81,6 @@ function isTokenNotFound(error) {
          (msg.includes('execution reverted') && !msg.includes('rate') && !msg.includes('limit'));
 }
 
-// Execute a call, retrying across multiple RPCs
 async function rpcCall(rpcManager, contractAddress, callFn, maxAttempts = 6) {
   let lastError;
 
@@ -94,38 +92,31 @@ async function rpcCall(rpcManager, contractAddress, callFn, maxAttempts = 6) {
       lastError = error;
       const msg = error.message || '';
 
-      // If it's a legitimate contract revert, don't retry on other RPCs
       if (isTokenNotFound(error)) {
         throw error;
       }
 
       console.log(`RPC call failed (${rpcManager.rpc}): ${msg.substring(0, 80)}`);
       rpcManager.recordFailure();
-
       await new Promise(r => setTimeout(r, 300));
     }
   }
   throw lastError;
 }
 
-// Discover the highest tokenId via binary search
 async function discoverHighestTokenId(rpcManager, contractAddress, sendProgress) {
   sendProgress({ type: 'info', message: 'totalSupply() not available, discovering token range...' });
 
-  // First check if tokens start at 0 or 1
   let startsAtZero = false;
   try {
     await rpcCall(rpcManager, contractAddress, c => c.tokenURI(0), 3);
     startsAtZero = true;
   } catch { /* starts at 1 or 0 doesn't exist */ }
 
-  // Binary search for the highest tokenId that exists
-  // Note: there may be gaps, so we look for the highest ID where ownerOf doesn't revert
   let low = startsAtZero ? 0 : 1;
   let high = 20000;
   let lastValid = low;
 
-  // First find a rough upper bound
   let probe = 100;
   while (probe <= high) {
     try {
@@ -139,7 +130,6 @@ async function discoverHighestTokenId(rpcManager, contractAddress, sendProgress)
     await new Promise(r => setTimeout(r, 100));
   }
 
-  // Binary search between lastValid and high
   low = lastValid;
   while (low <= high) {
     const mid = Math.floor((low + high) / 2);
@@ -154,7 +144,7 @@ async function discoverHighestTokenId(rpcManager, contractAddress, sendProgress)
   }
 
   const startId = startsAtZero ? 0 : 1;
-  sendProgress({ type: 'info', message: `Token IDs range from ${startId} to ${lastValid} (scanning for existing tokens)` });
+  sendProgress({ type: 'info', message: `Token IDs range from ${startId} to ${lastValid}` });
   return { startId, endId: lastValid };
 }
 
@@ -162,59 +152,170 @@ export async function analyzeContract(contractAddress, sendProgress, options = {
   const manager = new RpcManager();
   const maxTokens = options.maxTokens || 10000;
   const delayBetweenRequests = options.delay || 300;
-  const maxConsecutiveRpcErrors = 10; // Only counts real RPC failures, not missing tokens
+  const maxConsecutiveRpcErrors = 10;
   const results = [];
 
+  // Normalize address to lowercase for consistent DB keys
+  contractAddress = contractAddress.toLowerCase();
+
   try {
-    // Get contract name / symbol
-    let name, symbol;
-    try {
-      name = await rpcCall(manager, contractAddress, c => c.name());
-    } catch { /* ignore */ }
-    try {
-      symbol = await rpcCall(manager, contractAddress, c => c.symbol());
-    } catch { /* ignore */ }
-
-    sendProgress({
-      type: 'info',
-      message: `Analyzing contract: ${name || 'Unknown'} (${symbol || 'Unknown'}) via ${manager.rpc}`
-    });
-
-    // Determine token range
-    let startId = 1;
-    let endId;
-
-    try {
-      const totalSupply = Number(await rpcCall(manager, contractAddress, c => c.totalSupply()));
-      endId = totalSupply;
-      // Check if tokenByIndex is available (ERC721Enumerable)
-      try {
-        await rpcCall(manager, contractAddress, c => c.tokenByIndex(0), 3);
-        // Has enumerable - we can get exact token IDs
-        sendProgress({ type: 'info', message: `Contract has ${totalSupply} tokens (enumerable)` });
-      } catch {
-        // No enumerable, just iterate 1..totalSupply
-      }
-    } catch {
-      // totalSupply() not supported - discover via probing
-      const range = await discoverHighestTokenId(manager, contractAddress, sendProgress);
-      startId = range.startId;
-      endId = range.endId;
-    }
-
-    const scanCount = Math.min(endId - startId + 1, maxTokens);
+    // Check for existing analysis to resume
+    const existing = getContractAnalysis.get(contractAddress);
+    let name, symbol, startId, endId, resumeFromId;
     let existingTokens = 0;
     let skippedTokens = 0;
 
-    sendProgress({
-      type: 'start',
-      total: scanCount,
-      contract: { address: contractAddress, name, symbol }
-    });
+    if (existing && existing.end_id > 0) {
+      // Resume from where we left off
+      name = existing.name;
+      symbol = existing.symbol;
+      startId = existing.start_id;
+      endId = existing.end_id;
+      resumeFromId = existing.last_scanned_id + 1;
+      existingTokens = existing.tokens_found;
+      skippedTokens = existing.tokens_skipped;
+
+      sendProgress({
+        type: 'info',
+        message: `Resuming analysis of ${name || 'Unknown'} (${symbol || 'Unknown'}) from token #${resumeFromId}`
+      });
+
+      // Send existing tokens first so UI shows previous results immediately
+      const savedTokens = getContractTokens.all(contractAddress);
+      for (const t of savedTokens) {
+        const tokenData = {
+          tokenId: t.token_id,
+          tokenURI: t.token_uri,
+          metadataHash: t.metadata_hash,
+          metadataStatus: t.metadata_status || 'unknown',
+          imageHash: t.image_hash,
+          imageStatus: t.image_status || 'none',
+          animationHash: t.animation_hash,
+          animationStatus: t.animation_status || 'none',
+        };
+        results.push(tokenData);
+      }
+
+      // If already complete, send results and finish
+      if (existing.status === 'complete') {
+        sendProgress({
+          type: 'start',
+          total: endId - startId + 1,
+          contract: { address: contractAddress, name, symbol }
+        });
+
+        for (const tokenData of results) {
+          sendProgress({
+            type: 'token',
+            token: tokenData,
+            progress: {
+              current: endId - startId + 1,
+              total: endId - startId + 1,
+              percentage: 100
+            }
+          });
+        }
+
+        sendProgress({
+          type: 'info',
+          message: `Analysis already complete. ${existingTokens} tokens found, ${skippedTokens} empty IDs skipped.`
+        });
+        sendProgress({ type: 'complete', results });
+        return results;
+      }
+
+      // Send previously found tokens to the UI
+      if (results.length > 0) {
+        sendProgress({
+          type: 'start',
+          total: endId - startId + 1,
+          contract: { address: contractAddress, name, symbol }
+        });
+        for (const tokenData of results) {
+          sendProgress({
+            type: 'token',
+            token: tokenData,
+            progress: {
+              current: resumeFromId - startId,
+              total: endId - startId + 1,
+              percentage: Math.round(((resumeFromId - startId) / (endId - startId + 1)) * 100)
+            }
+          });
+        }
+        sendProgress({
+          type: 'info',
+          message: `Loaded ${results.length} cached tokens, continuing scan from #${resumeFromId}...`
+        });
+      }
+    } else {
+      // Fresh analysis
+      try {
+        name = await rpcCall(manager, contractAddress, c => c.name());
+      } catch { /* ignore */ }
+      try {
+        symbol = await rpcCall(manager, contractAddress, c => c.symbol());
+      } catch { /* ignore */ }
+
+      sendProgress({
+        type: 'info',
+        message: `Analyzing contract: ${name || 'Unknown'} (${symbol || 'Unknown'}) via ${manager.rpc}`
+      });
+
+      try {
+        const totalSupply = Number(await rpcCall(manager, contractAddress, c => c.totalSupply()));
+        startId = 1;
+        endId = totalSupply;
+        try {
+          await rpcCall(manager, contractAddress, c => c.tokenByIndex(0), 3);
+          sendProgress({ type: 'info', message: `Contract has ${totalSupply} tokens (enumerable)` });
+        } catch { /* not enumerable */ }
+      } catch {
+        const range = await discoverHighestTokenId(manager, contractAddress, sendProgress);
+        startId = range.startId;
+        endId = range.endId;
+      }
+
+      resumeFromId = startId;
+
+      // Save initial contract state
+      saveContractAnalysis.run(
+        contractAddress, name || null, symbol || null,
+        startId, endId, startId - 1, 0, 0, 'in_progress', Date.now()
+      );
+    }
+
+    const scanCount = endId - startId + 1;
+
+    if (!results.length) {
+      sendProgress({
+        type: 'start',
+        total: scanCount,
+        contract: { address: contractAddress, name, symbol }
+      });
+    }
 
     let consecutiveRpcErrors = 0;
 
-    for (let tokenId = startId; tokenId <= endId && results.length < maxTokens; tokenId++) {
+    for (let tokenId = resumeFromId; tokenId <= endId && existingTokens < maxTokens; tokenId++) {
+      // Skip tokens we already know don't exist
+      if (isTokenSkipped.get(contractAddress, tokenId)) {
+        skippedTokens++;
+        sendProgress({
+          type: 'skip',
+          tokenId,
+          progress: {
+            current: tokenId - startId + 1,
+            total: scanCount,
+            percentage: Math.round(((tokenId - startId + 1) / scanCount) * 100)
+          }
+        });
+        // Update progress in DB periodically (every 10 skips)
+        if (skippedTokens % 10 === 0) {
+          updateContractProgress.run(tokenId, existingTokens, skippedTokens, 'in_progress', Date.now(), contractAddress);
+        }
+        continue;
+      }
+
       try {
         const tokenURI = await rpcCall(manager, contractAddress, c => c.tokenURI(tokenId));
         consecutiveRpcErrors = 0;
@@ -252,7 +353,18 @@ export async function analyzeContract(contractAddress, sendProgress, options = {
           metadata
         };
 
-        saveTokenAnalysis.run(contractAddress, tokenId, tokenURI, metadataHash, imageHash, animationHash);
+        // Save token to DB immediately
+        saveTokenAnalysis.run(
+          contractAddress, tokenId, tokenURI,
+          metadataHash, metadataStatus?.status || 'unknown',
+          imageHash, imageStatus?.status || (imageHash ? 'unknown' : 'none'),
+          animationHash, animationStatus?.status || (animationHash ? 'unknown' : 'none'),
+          Date.now()
+        );
+
+        // Update contract progress in DB
+        updateContractProgress.run(tokenId, existingTokens, skippedTokens, 'in_progress', Date.now(), contractAddress);
+
         results.push(tokenData);
 
         sendProgress({
@@ -267,8 +379,9 @@ export async function analyzeContract(contractAddress, sendProgress, options = {
 
       } catch (error) {
         if (isTokenNotFound(error)) {
-          // Token ID doesn't exist (burned or never minted) - just skip it
           skippedTokens++;
+          saveSkippedToken.run(contractAddress, tokenId);
+
           sendProgress({
             type: 'skip',
             tokenId,
@@ -278,15 +391,20 @@ export async function analyzeContract(contractAddress, sendProgress, options = {
               percentage: Math.round(((tokenId - startId + 1) / scanCount) * 100)
             }
           });
+
+          // Update progress in DB
+          updateContractProgress.run(tokenId, existingTokens, skippedTokens, 'in_progress', Date.now(), contractAddress);
         } else {
-          // Real RPC error
           consecutiveRpcErrors++;
           console.error(`RPC error token ${tokenId}:`, error.message?.substring(0, 80));
+
+          // Save progress before potentially stopping
+          updateContractProgress.run(tokenId - 1, existingTokens, skippedTokens, 'paused', Date.now(), contractAddress);
 
           if (consecutiveRpcErrors >= maxConsecutiveRpcErrors) {
             sendProgress({
               type: 'info',
-              message: `Stopped after ${maxConsecutiveRpcErrors} consecutive RPC errors. Found ${existingTokens} tokens, skipped ${skippedTokens} non-existent IDs.`
+              message: `Paused after ${maxConsecutiveRpcErrors} consecutive RPC errors. Found ${existingTokens} tokens, skipped ${skippedTokens} empty IDs. Resume anytime.`
             });
             break;
           }
@@ -298,9 +416,20 @@ export async function analyzeContract(contractAddress, sendProgress, options = {
       }
     }
 
+    // Mark as complete if we scanned everything
+    const lastScanned = Math.min(endId, resumeFromId + scanCount - 1);
+    const isComplete = lastScanned >= endId;
+    updateContractProgress.run(
+      lastScanned, existingTokens, skippedTokens,
+      isComplete ? 'complete' : 'paused',
+      Date.now(), contractAddress
+    );
+
     sendProgress({
       type: 'info',
-      message: `Scan complete. Found ${existingTokens} existing tokens, skipped ${skippedTokens} non-existent IDs.`
+      message: isComplete
+        ? `Scan complete. ${existingTokens} tokens found, ${skippedTokens} empty IDs skipped.`
+        : `Scan paused at #${lastScanned}. ${existingTokens} tokens found so far. Resume anytime.`
     });
 
     sendProgress({ type: 'complete', results });
