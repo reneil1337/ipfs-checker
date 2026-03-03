@@ -1,7 +1,7 @@
 import { ethers } from 'ethers';
 import { fetchMetadata, extractHashesFromMetadata, checkIpfsHash, extractHashFromUri } from './ipfs.js';
 import {
-  saveTokenAnalysis, saveContractAnalysis, updateContractProgress,
+  saveTokenAnalysis, saveContractAnalysis, updateContractProgress, updateContractUri,
   getContractAnalysis, getContractTokens, saveSkippedToken, isTokenSkipped
 } from './db.js';
 
@@ -22,6 +22,7 @@ const ERC721_ABI = [
   'function totalSupply() view returns (uint256)',
   'function tokenByIndex(uint256 index) view returns (uint256)',
   'function tokenURI(uint256 tokenId) view returns (string)',
+  'function contractURI() view returns (string)',
   'function ownerOf(uint256 tokenId) view returns (address)',
   'function balanceOf(address owner) view returns (uint256)',
   'function symbol() view returns (string)',
@@ -148,6 +149,28 @@ async function discoverHighestTokenId(rpcManager, contractAddress, sendProgress)
   return { startId, endId: lastValid };
 }
 
+/**
+ * Fetch and check the contractURI for a given address.
+ * Returns { contractURI, contractURIHash, contractURIStatus } or null.
+ */
+export async function fetchContractURI(contractAddress) {
+  const manager = new RpcManager();
+  try {
+    const uri = await rpcCall(manager, contractAddress, c => c.contractURI(), 3);
+    if (!uri) return null;
+    const hash = extractHashFromUri(uri);
+    if (!hash) return { contractURI: uri, contractURIHash: null, contractURIStatus: 'non-ipfs' };
+    const check = await checkIpfsHash(hash);
+    return {
+      contractURI: uri,
+      contractURIHash: hash,
+      contractURIStatus: check?.status || 'unknown'
+    };
+  } catch {
+    return null; // contractURI() not supported
+  }
+}
+
 export async function analyzeContract(contractAddress, sendProgress, options = {}) {
   const manager = new RpcManager();
   const maxTokens = options.maxTokens || 10000;
@@ -165,6 +188,10 @@ export async function analyzeContract(contractAddress, sendProgress, options = {
     let existingTokens = 0;
     let skippedTokens = 0;
 
+    let contractURI = null;
+    let contractURIHash = null;
+    let contractURIStatus = null;
+
     if (existing && existing.end_id > 0) {
       // Resume from where we left off
       name = existing.name;
@@ -174,6 +201,9 @@ export async function analyzeContract(contractAddress, sendProgress, options = {
       resumeFromId = existing.last_scanned_id + 1;
       existingTokens = existing.tokens_found;
       skippedTokens = existing.tokens_skipped;
+      contractURI = existing.contract_uri || null;
+      contractURIHash = existing.contract_uri_hash || null;
+      contractURIStatus = existing.contract_uri_status || null;
 
       sendProgress({
         type: 'info',
@@ -201,7 +231,7 @@ export async function analyzeContract(contractAddress, sendProgress, options = {
         sendProgress({
           type: 'start',
           total: endId - startId + 1,
-          contract: { address: contractAddress, name, symbol }
+          contract: { address: contractAddress, name, symbol, contractURI, contractURIHash, contractURIStatus }
         });
 
         for (const tokenData of results) {
@@ -229,7 +259,7 @@ export async function analyzeContract(contractAddress, sendProgress, options = {
         sendProgress({
           type: 'start',
           total: endId - startId + 1,
-          contract: { address: contractAddress, name, symbol }
+          contract: { address: contractAddress, name, symbol, contractURI, contractURIHash, contractURIStatus }
         });
         for (const tokenData of results) {
           sendProgress({
@@ -256,6 +286,21 @@ export async function analyzeContract(contractAddress, sendProgress, options = {
         symbol = await rpcCall(manager, contractAddress, c => c.symbol());
       } catch { /* ignore */ }
 
+      // Fetch contractURI (collection-level metadata)
+      try {
+        contractURI = await rpcCall(manager, contractAddress, c => c.contractURI(), 3);
+        if (contractURI) {
+          contractURIHash = extractHashFromUri(contractURI);
+          if (contractURIHash) {
+            sendProgress({ type: 'info', message: `Checking contractURI: ${contractURI}` });
+            const uriCheck = await checkIpfsHash(contractURIHash);
+            contractURIStatus = uriCheck?.status || 'unknown';
+          } else {
+            contractURIStatus = 'non-ipfs';
+          }
+        }
+      } catch { /* contractURI() not supported */ }
+
       sendProgress({
         type: 'info',
         message: `Analyzing contract: ${name || 'Unknown'} (${symbol || 'Unknown'}) via ${manager.rpc}`
@@ -280,7 +325,8 @@ export async function analyzeContract(contractAddress, sendProgress, options = {
       // Save initial contract state
       saveContractAnalysis.run(
         contractAddress, name || null, symbol || null,
-        startId, endId, startId - 1, 0, 0, 'in_progress', Date.now()
+        startId, endId, startId - 1, 0, 0, 'in_progress', Date.now(),
+        contractURI || null, contractURIHash || null, contractURIStatus || null
       );
     }
 
@@ -290,7 +336,7 @@ export async function analyzeContract(contractAddress, sendProgress, options = {
       sendProgress({
         type: 'start',
         total: scanCount,
-        contract: { address: contractAddress, name, symbol }
+        contract: { address: contractAddress, name, symbol, contractURI, contractURIHash, contractURIStatus }
       });
     }
 

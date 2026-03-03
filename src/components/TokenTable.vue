@@ -5,6 +5,10 @@ const props = defineProps({
   tokens: {
     type: Array,
     required: true
+  },
+  contractInfo: {
+    type: Object,
+    default: null
   }
 })
 
@@ -97,6 +101,63 @@ function hasIssues(token) {
          token.animationStatus === 'offline' ||
          token.animationStatus === 'unknown'
 }
+
+function escapeCsvField(value) {
+  if (value == null) return ''
+  const str = String(value)
+  if (str.includes(',') || str.includes('"') || str.includes('\n')) {
+    return '"' + str.replace(/"/g, '""') + '"'
+  }
+  return str
+}
+
+function downloadCsv() {
+  const lines = []
+
+  // Contract-level info
+  if (props.contractInfo) {
+    lines.push(`# Contract: ${props.contractInfo.name || 'Unknown'} (${props.contractInfo.symbol || ''})`)
+    lines.push(`# Address: ${props.contractInfo.address || ''}`)
+    if (props.contractInfo.contractURI) {
+      lines.push(`# Contract URI: ${escapeCsvField(props.contractInfo.contractURI)}`)
+      lines.push(`# Contract URI Hash: ${props.contractInfo.contractURIHash || ''}`)
+      lines.push(`# Contract URI Status: ${props.contractInfo.contractURIStatus || ''}`)
+    }
+    lines.push('')
+  }
+
+  const headers = [
+    'Token ID', 'Token URI',
+    'Metadata Hash', 'Metadata Status',
+    'Image Hash', 'Image Status',
+    'Animation Hash', 'Animation Status'
+  ]
+
+  const rows = sortedTokens.value.map(t => [
+    t.tokenId,
+    t.tokenURI || '',
+    t.metadataHash || '',
+    t.metadataStatus || '',
+    t.imageHash || '',
+    t.imageStatus || '',
+    t.animationHash || '',
+    t.animationStatus || ''
+  ])
+
+  lines.push(headers.map(escapeCsvField).join(','))
+  for (const r of rows) {
+    lines.push(r.map(escapeCsvField).join(','))
+  }
+
+  const csv = lines.join('\n')
+  const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' })
+  const url = URL.createObjectURL(blob)
+  const link = document.createElement('a')
+  link.href = url
+  link.download = `ipfs-check-${Date.now()}.csv`
+  link.click()
+  URL.revokeObjectURL(url)
+}
 </script>
 
 <template>
@@ -107,7 +168,7 @@ function hasIssues(token) {
         <div class="text-sm font-medium text-gray-700">
           Summary:
         </div>
-        <div class="flex gap-2">
+        <div class="flex gap-2 flex-1">
           <span class="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-blue-100 text-blue-800">
             Total: {{ summary.total }}
           </span>
@@ -121,6 +182,15 @@ function hasIssues(token) {
             Errors: {{ summary.errors }}
           </span>
         </div>
+        <button
+          @click="downloadCsv"
+          class="inline-flex items-center px-3 py-1.5 border border-gray-300 text-sm font-medium rounded-md text-gray-700 bg-white hover:bg-gray-100 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-indigo-500 transition-colors"
+        >
+          <svg class="h-4 w-4 mr-1.5 text-gray-500" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"/>
+          </svg>
+          Download CSV
+        </button>
       </div>
     </div>
 

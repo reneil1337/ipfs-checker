@@ -25,7 +25,10 @@ db.exec(`
     tokens_found INTEGER NOT NULL DEFAULT 0,
     tokens_skipped INTEGER NOT NULL DEFAULT 0,
     status TEXT NOT NULL DEFAULT 'pending',
-    last_updated INTEGER NOT NULL
+    last_updated INTEGER NOT NULL,
+    contract_uri TEXT,
+    contract_uri_hash TEXT,
+    contract_uri_status TEXT
   );
 
   CREATE TABLE IF NOT EXISTS token_analysis (
@@ -49,6 +52,17 @@ db.exec(`
   );
 `);
 
+// Migration: add contract_uri columns to existing databases
+try {
+  db.exec(`ALTER TABLE contract_analysis ADD COLUMN contract_uri TEXT`);
+} catch { /* column already exists */ }
+try {
+  db.exec(`ALTER TABLE contract_analysis ADD COLUMN contract_uri_hash TEXT`);
+} catch { /* column already exists */ }
+try {
+  db.exec(`ALTER TABLE contract_analysis ADD COLUMN contract_uri_status TEXT`);
+} catch { /* column already exists */ }
+
 // --- IPFS hash checks ---
 export const getHashStatus = db.prepare('SELECT * FROM ipfs_checks WHERE hash = ?');
 export const saveHashStatus = db.prepare(`
@@ -68,8 +82,9 @@ export const getContractAnalysis = db.prepare(
 export const saveContractAnalysis = db.prepare(`
   INSERT INTO contract_analysis (
     contract_address, name, symbol, start_id, end_id, last_scanned_id,
-    tokens_found, tokens_skipped, status, last_updated
-  ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    tokens_found, tokens_skipped, status, last_updated,
+    contract_uri, contract_uri_hash, contract_uri_status
+  ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   ON CONFLICT(contract_address) DO UPDATE SET
     name = excluded.name,
     symbol = excluded.symbol,
@@ -79,12 +94,21 @@ export const saveContractAnalysis = db.prepare(`
     tokens_found = excluded.tokens_found,
     tokens_skipped = excluded.tokens_skipped,
     status = excluded.status,
-    last_updated = excluded.last_updated
+    last_updated = excluded.last_updated,
+    contract_uri = excluded.contract_uri,
+    contract_uri_hash = excluded.contract_uri_hash,
+    contract_uri_status = excluded.contract_uri_status
 `);
 
 export const updateContractProgress = db.prepare(`
   UPDATE contract_analysis
   SET last_scanned_id = ?, tokens_found = ?, tokens_skipped = ?, status = ?, last_updated = ?
+  WHERE contract_address = ?
+`);
+
+export const updateContractUri = db.prepare(`
+  UPDATE contract_analysis
+  SET contract_uri = ?, contract_uri_hash = ?, contract_uri_status = ?, last_updated = ?
   WHERE contract_address = ?
 `);
 

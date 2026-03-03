@@ -5,8 +5,8 @@ import cors from 'cors';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { analyzeContract } from './contract.js';
-import { recheckOfflineHashes } from './ipfs.js';
-import { getContractTokens, getContractAnalysis, getAllContracts, getTokensToRecheck } from './db.js';
+import { recheckOfflineHashes, checkIpfsHash } from './ipfs.js';
+import { getContractTokens, getContractAnalysis, getAllContracts, getTokensToRecheck, updateContractUri } from './db.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
@@ -70,13 +70,31 @@ app.get('/api/analyze/:address', (req, res) => {
 });
 
 // Get cached analysis state and tokens for a contract
-app.get('/api/results/:address', (req, res) => {
+app.get('/api/results/:address', async (req, res) => {
   const { address } = req.params;
   const normalized = address.toLowerCase();
   
   try {
     const analysis = getContractAnalysis.get(normalized);
     const tokens = getContractTokens.all(normalized);
+
+    // Lazy-fetch contractURI if column exists but was never populated
+    if (analysis && analysis.contract_uri === null && analysis.contract_uri_hash === null) {
+      try {
+        const { fetchContractURI } = await import('./contract.js');
+        const uriData = await fetchContractURI(normalized);
+        if (uriData) {
+          updateContractUri.run(
+            uriData.contractURI, uriData.contractURIHash,
+            uriData.contractURIStatus, Date.now(), normalized
+          );
+          analysis.contract_uri = uriData.contractURI;
+          analysis.contract_uri_hash = uriData.contractURIHash;
+          analysis.contract_uri_status = uriData.contractURIStatus;
+        }
+      } catch { /* contractURI not supported or RPC error */ }
+    }
+
     res.json({
       contract: normalized,
       analysis: analysis || null,
@@ -129,23 +147,45 @@ app.get('/api/recheck/:address', (req, res) => {
 
   req.on('close', () => { closed = true; });
 
+  // Recheck contractURI first if it's offline/unknown
+  const analysis = getContractAnalysis.get(normalized);
+  let contractUriUpdated = 0;
+  const recheckContractUri = async () => {
+    if (analysis && analysis.contract_uri_hash &&
+        (analysis.contract_uri_status === 'offline' || analysis.contract_uri_status === 'unknown')) {
+      send({ type: 'info', message: `Rechecking contractURI hash...` });
+      const result = await checkIpfsHash(analysis.contract_uri_hash, true);
+      const newStatus = result?.status || 'unknown';
+      const changed = newStatus !== analysis.contract_uri_status;
+      if (changed) {
+        updateContractUri.run(analysis.contract_uri, analysis.contract_uri_hash, newStatus, Date.now(), normalized);
+        contractUriUpdated = 1;
+      }
+      send({ type: 'recheck_contract_uri', status: newStatus, changed });
+    }
+  };
+
   // Fetch tokens that need rechecking
   const tokens = getTokensToRecheck.all(normalized);
 
-  if (!tokens || tokens.length === 0) {
+  if ((!tokens || tokens.length === 0) && !analysis?.contract_uri_hash) {
     send({ type: 'info', message: 'No offline or unknown hashes to recheck.' });
     send({ type: 'complete', updated: 0 });
-    // Don't call res.end() — let the client close the connection after
-    // processing the complete event. Ending server-side causes EventSource
-    // to fire onerror before the final message is handled.
     return;
   }
 
-  send({ type: 'info', message: `Rechecking ${tokens.length} tokens with offline/unknown hashes...` });
+  const totalItems = (tokens?.length || 0) + (analysis?.contract_uri_hash && (analysis.contract_uri_status === 'offline' || analysis.contract_uri_status === 'unknown') ? 1 : 0);
+  send({ type: 'info', message: `Rechecking ${totalItems} item(s) with offline/unknown hashes...` });
 
-  recheckOfflineHashes(normalized, tokens, send)
-    .then(updated => {
-      send({ type: 'complete', updated });
+  recheckContractUri()
+    .then(() => {
+      if (!tokens || tokens.length === 0) {
+        return 0;
+      }
+      return recheckOfflineHashes(normalized, tokens, send);
+    })
+    .then(tokenUpdated => {
+      send({ type: 'complete', updated: (tokenUpdated || 0) + contractUriUpdated });
     })
     .catch(err => {
       console.error('Recheck error:', err);

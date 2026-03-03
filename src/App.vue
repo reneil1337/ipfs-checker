@@ -8,13 +8,9 @@ const isRechecking = ref(false)
 const progress = reactive({
   current: 0,
   total: 0,
-  percentage: 0
-})
-const recheckProgress = reactive({
-  current: 0,
-  total: 0,
   percentage: 0,
-  updated: 0
+  updated: 0,       // recheck: how many items changed
+  mode: null         // 'analyze' | 'recheck' | null
 })
 const stats = reactive({
   found: 0,
@@ -56,7 +52,10 @@ async function loadCachedResults(address) {
         contractInfo.value = {
           address: normalized,
           name: data.analysis.name,
-          symbol: data.analysis.symbol
+          symbol: data.analysis.symbol,
+          contractURI: data.analysis.contract_uri || null,
+          contractURIHash: data.analysis.contract_uri_hash || null,
+          contractURIStatus: data.analysis.contract_uri_status || null
         }
         analysisStatus.value = data.analysis.status
         stats.found = data.analysis.tokens_found
@@ -100,9 +99,12 @@ async function startAnalysis() {
     progress.current = 0
     progress.total = 0
     progress.percentage = 0
+    progress.updated = 0
+    progress.mode = null
     contractInfo.value = null
     analysisStatus.value = null
   }
+  progress.mode = 'analyze'
 
   statusMessage.value = 'Connecting...'
   
@@ -126,7 +128,12 @@ async function startAnalysis() {
         
       case 'start':
         progress.total = data.total
-        contractInfo.value = data.contract
+        contractInfo.value = {
+          ...data.contract,
+          contractURI: data.contract.contractURI || null,
+          contractURIHash: data.contract.contractURIHash || null,
+          contractURIStatus: data.contract.contractURIStatus || null
+        }
         analysisStatus.value = 'in_progress'
         statusMessage.value = `Scanning ${data.total} token IDs...`
         break
@@ -157,6 +164,7 @@ async function startAnalysis() {
       case 'complete':
         isAnalyzing.value = false
         analysisStatus.value = 'complete'
+        progress.mode = null
         statusMessage.value = `Done! ${stats.found} tokens found, ${stats.skipped} empty IDs skipped.`
         eventSource.value.close()
         loadPreviousContracts()
@@ -165,6 +173,7 @@ async function startAnalysis() {
       case 'error':
         error.value = data.error
         isAnalyzing.value = false
+        progress.mode = null
         eventSource.value.close()
         break
     }
@@ -179,6 +188,7 @@ async function startAnalysis() {
       statusMessage.value = `Connection lost. ${stats.found} tokens saved. Hit Continue to resume.`
     }
     isAnalyzing.value = false
+    progress.mode = null
     eventSource.value.close()
   }
 }
@@ -190,6 +200,7 @@ function stopAnalysis() {
   }
   isAnalyzing.value = false
   analysisStatus.value = 'paused'
+  progress.mode = null
   statusMessage.value = `Paused. ${stats.found} tokens saved. Hit Continue to resume.`
 }
 
@@ -208,11 +219,15 @@ function getButtonLabel() {
 
 // Count tokens that have offline or unknown statuses (candidates for recheck)
 const recheckCount = computed(() => {
-  return results.value.filter(t =>
+  let count = results.value.filter(t =>
     t.metadataStatus === 'offline' || t.metadataStatus === 'unknown' ||
     t.imageStatus === 'offline' || t.imageStatus === 'unknown' ||
     t.animationStatus === 'offline' || t.animationStatus === 'unknown'
   ).length
+  // Include contractURI if it's offline/unknown
+  const cStatus = contractInfo.value?.contractURIStatus
+  if (cStatus === 'offline' || cStatus === 'unknown') count++
+  return count
 })
 
 // Recheck offline/unknown hashes via SSE
@@ -222,10 +237,11 @@ function startRecheck() {
 
   error.value = null
   isRechecking.value = true
-  recheckProgress.current = 0
-  recheckProgress.total = 0
-  recheckProgress.percentage = 0
-  recheckProgress.updated = 0
+  progress.current = 0
+  progress.total = 0
+  progress.percentage = 0
+  progress.updated = 0
+  progress.mode = 'recheck'
   statusMessage.value = 'Starting recheck of offline/unknown hashes...'
 
   if (eventSource.value) {
@@ -242,22 +258,31 @@ function startRecheck() {
         statusMessage.value = data.message
         break
 
+      case 'recheck_contract_uri':
+        if (contractInfo.value) {
+          contractInfo.value.contractURIStatus = data.status
+        }
+        if (data.changed) progress.updated++
+        statusMessage.value = `Rechecked contractURI: ${data.status}`
+        break
+
       case 'recheck': {
         // Update the token in results with new statuses
         const idx = results.value.findIndex(r => r.tokenId === data.token.tokenId)
         if (idx >= 0) {
           results.value[idx] = { ...results.value[idx], ...data.token }
         }
-        recheckProgress.current = data.progress.current
-        recheckProgress.total = data.progress.total
-        recheckProgress.percentage = data.progress.percentage
-        if (data.changed) recheckProgress.updated++
-        statusMessage.value = `Rechecking: ${data.progress.current}/${data.progress.total} — ${recheckProgress.updated} updated`
+        progress.current = data.progress.current
+        progress.total = data.progress.total
+        progress.percentage = data.progress.percentage
+        if (data.changed) progress.updated++
+        statusMessage.value = `Rechecking: ${data.progress.current}/${data.progress.total} — ${progress.updated} updated`
         break
       }
 
       case 'complete':
         isRechecking.value = false
+        progress.mode = null
         statusMessage.value = `Recheck complete. ${data.updated} token(s) updated.`
         eventSource.value.close()
         break
@@ -285,7 +310,8 @@ function stopRecheck() {
     eventSource.value = null
   }
   isRechecking.value = false
-  statusMessage.value = `Recheck stopped. ${recheckProgress.updated} token(s) updated so far.`
+  progress.mode = null
+  statusMessage.value = `Recheck stopped. ${progress.updated} token(s) updated so far.`
 }
 
 onMounted(() => {
@@ -345,12 +371,12 @@ onMounted(() => {
             :disabled="isAnalyzing || isRechecking || !contractAddress"
             class="inline-flex items-center px-4 py-2 border border-transparent text-sm font-medium rounded-md shadow-sm text-white bg-indigo-600 hover:bg-indigo-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-indigo-500 disabled:opacity-50 disabled:cursor-not-allowed"
           >
-            <span v-if="isAnalyzing">
+            <span v-if="isAnalyzing || isRechecking">
               <svg class="animate-spin -ml-1 mr-2 h-4 w-4 text-white inline" fill="none" viewBox="0 0 24 24">
                 <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
                 <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
               </svg>
-              Analyzing...
+              {{ isRechecking ? 'Rechecking...' : 'Analyzing...' }}
             </span>
             <span v-else>{{ getButtonLabel() }}</span>
           </button>
@@ -361,9 +387,16 @@ onMounted(() => {
           >
             Stop
           </button>
+          <button
+            v-if="isRechecking"
+            @click="stopRecheck"
+            class="inline-flex items-center px-4 py-2 border border-gray-300 text-sm font-medium rounded-md shadow-sm text-gray-700 bg-white hover:bg-gray-50 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-indigo-500"
+          >
+            Stop
+          </button>
         </div>
         
-        <!-- Progress Bar -->
+        <!-- Unified Progress Bar -->
         <div v-if="progress.total > 0" class="mt-4">
           <div class="flex justify-between text-sm text-gray-600 mb-1">
             <span>{{ statusMessage }}</span>
@@ -372,7 +405,12 @@ onMounted(() => {
           <div class="w-full bg-gray-200 rounded-full h-2">
             <div
               class="h-2 rounded-full transition-all duration-300"
-              :class="analysisStatus === 'complete' ? 'bg-green-500' : analysisStatus === 'paused' ? 'bg-yellow-500' : 'bg-indigo-600'"
+              :class="{
+                'bg-green-500': !progress.mode && analysisStatus === 'complete',
+                'bg-yellow-500': !progress.mode && analysisStatus === 'paused',
+                'bg-orange-500': progress.mode === 'recheck',
+                'bg-indigo-600': progress.mode === 'analyze'
+              }"
               :style="{ width: progress.percentage + '%' }"
             ></div>
           </div>
@@ -435,6 +473,34 @@ onMounted(() => {
             <h2 class="text-lg font-medium text-gray-900">{{ contractInfo.name || 'Unknown' }}</h2>
             <p class="text-sm text-gray-500">{{ contractInfo.symbol || 'Unknown' }}</p>
           </div>
+          <!-- Contract URI status -->
+          <div v-if="contractInfo.contractURIHash" class="flex items-center gap-2">
+            <span class="text-xs text-gray-500">contractURI:</span>
+            <span
+              class="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium border"
+              :class="{
+                'bg-green-100 text-green-800 border-green-200': contractInfo.contractURIStatus === 'online',
+                'bg-red-100 text-red-800 border-red-200': contractInfo.contractURIStatus === 'offline',
+                'bg-yellow-100 text-yellow-800 border-yellow-200': contractInfo.contractURIStatus === 'unknown',
+                'bg-gray-50 text-gray-500 border-gray-200': contractInfo.contractURIStatus === 'non-ipfs'
+              }"
+            >
+              {{ contractInfo.contractURIStatus }}
+            </span>
+            <a
+              :href="`https://ipfs.io/ipfs/${contractInfo.contractURIHash}`"
+              target="_blank"
+              rel="noopener noreferrer"
+              class="text-xs text-indigo-600 hover:text-indigo-800 hover:underline font-mono"
+              :title="contractInfo.contractURIHash"
+            >
+              {{ contractInfo.contractURIHash.length > 20 ? contractInfo.contractURIHash.slice(0, 8) + '...' + contractInfo.contractURIHash.slice(-8) : contractInfo.contractURIHash }}
+            </a>
+          </div>
+          <div v-else-if="contractInfo.contractURI" class="flex items-center gap-2">
+            <span class="text-xs text-gray-500">contractURI:</span>
+            <span class="text-xs text-gray-400">non-IPFS</span>
+          </div>
           <div class="flex-1"></div>
           <button
             v-if="recheckCount > 0 && !isAnalyzing && !isRechecking"
@@ -459,26 +525,13 @@ onMounted(() => {
             View on Etherscan &rarr;
           </a>
         </div>
-
-        <!-- Recheck Progress Bar -->
-        <div v-if="isRechecking && recheckProgress.total > 0" class="mt-3">
-          <div class="flex justify-between text-sm text-gray-600 mb-1">
-            <span>{{ statusMessage }}</span>
-            <span>{{ recheckProgress.current }} / {{ recheckProgress.total }} ({{ recheckProgress.percentage }}%)</span>
-          </div>
-          <div class="w-full bg-gray-200 rounded-full h-2">
-            <div
-              class="bg-orange-500 h-2 rounded-full transition-all duration-300"
-              :style="{ width: recheckProgress.percentage + '%' }"
-            ></div>
-          </div>
-        </div>
       </div>
 
       <!-- Results Table -->
       <TokenTable
         v-if="results.length > 0"
         :tokens="results"
+        :contract-info="contractInfo"
       />
       
       <!-- Empty State -->
