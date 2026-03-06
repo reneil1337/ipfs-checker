@@ -63,6 +63,11 @@ try {
   db.exec(`ALTER TABLE contract_analysis ADD COLUMN contract_uri_status TEXT`);
 } catch { /* column already exists */ }
 
+// Migration: add skipped_at timestamp to skipped_tokens
+try {
+  db.exec(`ALTER TABLE skipped_tokens ADD COLUMN skipped_at INTEGER NOT NULL DEFAULT 0`);
+} catch { /* column already exists */ }
+
 // --- IPFS hash checks ---
 export const getHashStatus = db.prepare('SELECT * FROM ipfs_checks WHERE hash = ?');
 export const saveHashStatus = db.prepare(`
@@ -138,16 +143,24 @@ export const getContractTokens = db.prepare(
 );
 
 // --- Skipped tokens ---
+// Tokens are re-probed after 7 days (SKIP_TTL_MS) in case they were falsely skipped
+export const SKIP_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
+
 export const saveSkippedToken = db.prepare(`
-  INSERT OR IGNORE INTO skipped_tokens (contract_address, token_id) VALUES (?, ?)
+  INSERT INTO skipped_tokens (contract_address, token_id, skipped_at) VALUES (?, ?, ?)
+  ON CONFLICT(contract_address, token_id) DO UPDATE SET skipped_at = excluded.skipped_at
 `);
 
 export const isTokenSkipped = db.prepare(
-  'SELECT 1 FROM skipped_tokens WHERE contract_address = ? AND token_id = ?'
+  'SELECT 1 FROM skipped_tokens WHERE contract_address = ? AND token_id = ? AND skipped_at > ?'
 );
 
 export const getSkippedTokens = db.prepare(
   'SELECT token_id FROM skipped_tokens WHERE contract_address = ? ORDER BY token_id'
+);
+
+export const countExpiredSkips = db.prepare(
+  'SELECT COUNT(*) as count FROM skipped_tokens WHERE contract_address = ? AND skipped_at <= ?'
 );
 
 // --- Tokens needing recheck (offline or unknown on any hash) ---

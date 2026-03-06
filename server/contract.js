@@ -2,7 +2,8 @@ import { ethers } from 'ethers';
 import { fetchMetadata, extractHashesFromMetadata, checkIpfsHash, extractHashFromUri } from './ipfs.js';
 import {
   saveTokenAnalysis, saveContractAnalysis, updateContractProgress, updateContractUri,
-  getContractAnalysis, getContractTokens, saveSkippedToken, isTokenSkipped
+  getContractAnalysis, getContractTokens, getTokenAnalysis, saveSkippedToken, isTokenSkipped,
+  SKIP_TTL_MS, countExpiredSkips
 } from './db.js';
 
 // Primary RPC from env, with fallback list
@@ -74,16 +75,22 @@ class RpcManager {
 }
 
 function isTokenNotFound(error) {
-  const msg = error.message || '';
-  return msg.includes('invalid token ID') ||
+  const msg = (error.message || '').toLowerCase();
+  return msg.includes('invalid token id') ||
          msg.includes('nonexistent token') ||
-         msg.includes('URI query for nonexistent') ||
+         msg.includes('uri query for nonexistent') ||
          msg.includes('owner query for nonexistent') ||
-         (msg.includes('execution reverted') && !msg.includes('rate') && !msg.includes('limit'));
+         msg.includes('token does not exist') ||
+         msg.includes('query for nonexistent') ||
+         msg.includes('erc721nonexistenttoken') ||
+         msg.includes('erc721: invalid') ||
+         msg.includes('token id does not exist') ||
+         msg.includes('not been minted');
 }
 
 async function rpcCall(rpcManager, contractAddress, callFn, maxAttempts = 6) {
   let lastError;
+  let tokenNotFoundCount = 0;
 
   for (let attempt = 0; attempt < maxAttempts; attempt++) {
     const contract = rpcManager.getContract(contractAddress);
@@ -94,7 +101,14 @@ async function rpcCall(rpcManager, contractAddress, callFn, maxAttempts = 6) {
       const msg = error.message || '';
 
       if (isTokenNotFound(error)) {
-        throw error;
+        tokenNotFoundCount++;
+        // Confirm with a second RPC before treating as truly not found
+        if (tokenNotFoundCount >= 2) {
+          throw error;
+        }
+        rpcManager.rotate();
+        await new Promise(r => setTimeout(r, 200));
+        continue;
       }
 
       console.log(`RPC call failed (${rpcManager.rpc}): ${msg.substring(0, 80)}`);
@@ -107,6 +121,8 @@ async function rpcCall(rpcManager, contractAddress, callFn, maxAttempts = 6) {
 
 async function discoverHighestTokenId(rpcManager, contractAddress, sendProgress) {
   sendProgress({ type: 'info', message: 'totalSupply() not available, discovering token range...' });
+
+  const GAP_LOOKAHEAD = 20; // probe this many IDs past the last known valid to find tokens beyond gaps
 
   let startsAtZero = false;
   try {
@@ -142,6 +158,22 @@ async function discoverHighestTokenId(rpcManager, contractAddress, sendProgress)
       high = mid - 1;
     }
     await new Promise(r => setTimeout(r, 100));
+  }
+
+  // Lookahead past gaps: probe the next GAP_LOOKAHEAD IDs beyond lastValid.
+  // If any exist, update lastValid and repeat from the new position.
+  // Stop when GAP_LOOKAHEAD consecutive IDs are all nonexistent.
+  let foundMore = true;
+  while (foundMore) {
+    foundMore = false;
+    for (let id = lastValid + 1; id <= lastValid + GAP_LOOKAHEAD; id++) {
+      try {
+        await rpcCall(rpcManager, contractAddress, c => c.ownerOf(id), 3);
+        lastValid = id;
+        foundMore = true;
+      } catch { /* doesn't exist */ }
+      await new Promise(r => setTimeout(r, 100));
+    }
   }
 
   const startId = startsAtZero ? 0 : 1;
@@ -226,32 +258,45 @@ export async function analyzeContract(contractAddress, sendProgress, options = {
         results.push(tokenData);
       }
 
-      // If already complete, send results and finish
+      // If already complete, check if any skipped tokens have expired TTL and need re-probing
       if (existing.status === 'complete') {
-        sendProgress({
-          type: 'start',
-          total: endId - startId + 1,
-          contract: { address: contractAddress, name, symbol, contractURI, contractURIHash, contractURIStatus }
-        });
+        const expired = countExpiredSkips.get(contractAddress, Date.now() - SKIP_TTL_MS);
+        const hasExpiredSkips = expired && expired.count > 0;
 
-        for (const tokenData of results) {
+        if (!hasExpiredSkips) {
+          // Truly complete, no expired skips — return cached results
           sendProgress({
-            type: 'token',
-            token: tokenData,
-            progress: {
-              current: endId - startId + 1,
-              total: endId - startId + 1,
-              percentage: 100
-            }
+            type: 'start',
+            total: endId - startId + 1,
+            contract: { address: contractAddress, name, symbol, contractURI, contractURIHash, contractURIStatus }
           });
+
+          for (const tokenData of results) {
+            sendProgress({
+              type: 'token',
+              token: tokenData,
+              progress: {
+                current: endId - startId + 1,
+                total: endId - startId + 1,
+                percentage: 100
+              }
+            });
+          }
+
+          sendProgress({
+            type: 'info',
+            message: `Analysis already complete. ${existingTokens} tokens found, ${skippedTokens} empty IDs skipped.`
+          });
+          sendProgress({ type: 'complete', results });
+          return results;
         }
 
+        // Has expired skips — re-scan from the beginning to re-probe them
         sendProgress({
           type: 'info',
-          message: `Analysis already complete. ${existingTokens} tokens found, ${skippedTokens} empty IDs skipped.`
+          message: `${expired.count} previously skipped token(s) will be re-probed...`
         });
-        sendProgress({ type: 'complete', results });
-        return results;
+        resumeFromId = startId;
       }
 
       // Send previously found tokens to the UI
@@ -343,8 +388,14 @@ export async function analyzeContract(contractAddress, sendProgress, options = {
     let consecutiveRpcErrors = 0;
 
     for (let tokenId = resumeFromId; tokenId <= endId && existingTokens < maxTokens; tokenId++) {
-      // Skip tokens we already know don't exist
-      if (isTokenSkipped.get(contractAddress, tokenId)) {
+      // Skip tokens that were already successfully analyzed (avoids redundant RPC calls on re-probe runs)
+      if (getTokenAnalysis.get(contractAddress, tokenId)) {
+        existingTokens++;
+        continue;
+      }
+
+      // Skip tokens we already know don't exist (re-probe after TTL expires)
+      if (isTokenSkipped.get(contractAddress, tokenId, Date.now() - SKIP_TTL_MS)) {
         skippedTokens++;
         sendProgress({
           type: 'skip',
@@ -426,7 +477,7 @@ export async function analyzeContract(contractAddress, sendProgress, options = {
       } catch (error) {
         if (isTokenNotFound(error)) {
           skippedTokens++;
-          saveSkippedToken.run(contractAddress, tokenId);
+          saveSkippedToken.run(contractAddress, tokenId, Date.now());
 
           sendProgress({
             type: 'skip',

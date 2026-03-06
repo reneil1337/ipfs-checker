@@ -8,8 +8,8 @@ A Vue.js + Tailwind CSS application that analyzes Ethereum smart contracts and c
 - **Smart Contract Integration**: Reads ERC-721 token URIs using ethers.js
 - **IPFS Hash Checking**: Verifies availability of metadata, image, and animation URLs (HEAD with GET fallback to handle 403/405 gateways)
 - **RPC Failover**: Automatic rotation through multiple Ethereum RPC endpoints when one fails
-- **Token Discovery**: Binary-search probing to discover token ID ranges when `totalSupply()` is unavailable
-- **Burned/Missing Token Handling**: Gracefully skips non-existent token IDs instead of treating them as errors
+- **Token Discovery**: Binary-search probing to discover token ID ranges when `totalSupply()` is unavailable, with gap-aware lookahead that probes past non-contiguous token ID sequences (20-ID sliding window)
+- **Burned/Missing Token Handling**: Gracefully skips non-existent token IDs instead of treating them as errors. Skips are confirmed by querying a second RPC endpoint before being persisted, and automatically re-probed after 7 days (configurable TTL) to recover from false positives
 - **Recheck Offline/Unknown**: One-click button to force-recheck all hashes with offline or unknown status, streamed via SSE with a dedicated progress bar
 - **SQLite Caching**: Stores analysis results to avoid re-checking hashes (24-hour TTL)
 - **Responsive UI**: Built with Tailwind CSS with live status messages, skip counters, and per-status summary badges
@@ -93,17 +93,18 @@ npm run server
 2. The backend connects via the RPC manager, trying the primary RPC first and rotating on failure
 3. Token range discovery:
    - Tries `totalSupply()` first
-   - If unavailable, uses binary-search probing (`ownerOf`) to find the highest existing token ID
+   - If unavailable, uses binary-search probing (`ownerOf`) to find the highest existing token ID, then applies a gap-aware lookahead (20-ID sliding window) to discover tokens beyond gaps in the ID sequence
 4. For each token ID in the range:
    - Calls `tokenURI(tokenId)` to get the metadata URL
-   - If the token doesn't exist (burned/never minted), it is silently skipped
+   - If the token doesn't exist (burned/never minted), the skip is confirmed against a second RPC endpoint and then cached
    - Extracts the IPFS hash (and full path for subdirectory URIs like `ipfs://Qm.../1`)
    - Checks hash availability using HEAD, falling back to a ranged GET if the gateway returns 403/405
    - If metadata is online, fetches it and checks `image` and `animation_url` hashes
 5. Results stream to the UI in real-time via SSE (including `skip` events for missing tokens)
 6. Analysis stops early after 10 consecutive RPC errors to avoid hanging
 7. All hash checks are cached in SQLite with a 24-hour TTL
-8. After analysis, the user can click **Recheck offline/unknown** to force-recheck all hashes that were marked offline or unknown, bypassing the cache. Updated statuses are persisted and streamed live
+8. Skipped (non-existent) token IDs are cached with a 7-day TTL and automatically re-probed on subsequent analyses to recover from false positives
+9. After analysis, the user can click **Recheck offline/unknown** to force-recheck all hashes that were marked offline or unknown, bypassing the cache. Updated statuses are persisted and streamed live
 
 ## Database Schema
 
